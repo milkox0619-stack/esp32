@@ -1,0 +1,183 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <esp_now.h>
+#include <esp_wifi.h>
+#include <SD.h>
+#include <SPI.h>
+#include <driver/i2s.h>
+#include <vector>
+
+#include "AudioGeneratorMP3.h"
+#include "AudioFileSourceSD.h"
+#include "AudioOutputI2S.h"
+
+// 完全對齊你的 ESP32-S3 Mini 引腳定義
+#define SD_CS_PIN    10
+#define SPI_MOSI     11
+#define SPI_SCK      12
+#define SPI_MISO     13
+
+#define I2S_BCLK     4
+#define I2S_LRC      5
+#define I2S_DIN      6
+
+#define AMP_SD_PIN   7   
+#define MUTE_BTN_PIN 8   
+#define NEXT_BTN_PIN 9   
+
+#define WIFI_CHANNEL 1   
+
+// ESP-NOW 傳輸結構 (限制 240 位元組音訊數據)
+typedef struct {
+  uint16_t seq;
+  uint16_t len;
+  uint8_t  data[240]; 
+} AudioPacket;
+
+AudioPacket txPacket;
+uint8_t broadcastAddress[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+
+AudioFileSourceSD *fileSource = NULL;
+AudioGeneratorMP3 *mp3 = NULL;
+
+std::vector<String> playlist; 
+int current_track_index = 0;
+
+bool local_mute_state = false;
+unsigned long last_mute_btn_press = 0;
+unsigned long last_next_btn_press = 0;
+uint16_t packet_seq = 0;
+
+class CustomAudioOutput : public AudioOutputI2S {
+  public:
+    CustomAudioOutput() : AudioOutputI2S(0, 0) { txPacket.len = 0; }
+
+    virtual bool ConsumeSample(int16_t sample[2]) override {
+      // 每次打包 4 位元組 (左聲道16位元 + 右聲道16位元)
+      if (txPacket.len + 4 <= 240) {
+        // 左聲道 (Little-Endian 打包)
+        txPacket.data[txPacket.len++] = sample[0] & 0xFF;
+        txPacket.data[txPacket.len++] = (sample[0] >> 8) & 0xFF;
+        // 右聲道 (Little-Endian 打包)
+        txPacket.data[txPacket.len++] = sample[1] & 0xFF;
+        txPacket.data[txPacket.len++] = (sample[1] >> 8) & 0xFF;
+      }
+
+      // 緩衝區滿了立刻發射
+      if (txPacket.len >= 240) {
+        txPacket.seq = packet_seq++;
+        txPacket.len = 240;
+        esp_now_send(broadcastAddress, (uint8_t *)&txPacket, sizeof(txPacket));
+        txPacket.len = 0; 
+        yield(); 
+      }
+
+      return AudioOutputI2S::ConsumeSample(sample);
+    }
+};
+
+CustomAudioOutput *out = NULL;
+
+void scanSDPlaylist() {
+  playlist.clear();
+  File root = SD.open("/");
+  if (!root) return;
+  while (true) {
+    File entry = root.openNextFile();
+    if (!entry) break; 
+    if (!entry.isDirectory()) {
+      String fileName = String(entry.name());
+      if (fileName.endsWith(".mp3") || fileName.endsWith(".MP3")) {
+        playlist.push_back("/" + fileName);
+      }
+    }
+    entry.close();
+  }
+  root.close();
+}
+
+void playTrack(int index) {
+  if (playlist.empty()) return;
+  if (mp3 && mp3->isRunning()) { mp3->stop(); delay(150); }
+  if (fileSource) { delete fileSource; fileSource = NULL; }
+
+  txPacket.len = 0; 
+  String trackPath = playlist[index];
+  Serial.printf("發射端播放: %s\n", trackPath.c_str());
+
+  fileSource = new AudioFileSourceSD(trackPath.c_str());
+  mp3->begin(fileSource, out);
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000); 
+
+  pinMode(SD_CS_PIN, OUTPUT);
+  pinMode(SPI_MOSI, OUTPUT);
+  pinMode(SPI_SCK, OUTPUT);
+  pinMode(SPI_MISO, INPUT);
+  digitalWrite(SD_CS_PIN, HIGH); 
+
+  pinMode(AMP_SD_PIN, OUTPUT);
+  pinMode(MUTE_BTN_PIN, INPUT_PULLUP);
+  pinMode(NEXT_BTN_PIN, INPUT_PULLUP);
+  digitalWrite(AMP_SD_PIN, HIGH); 
+
+  SPI.begin(SPI_SCK, SPI_MISO, SPI_MOSI, SD_CS_PIN);
+  if (!SD.begin(SD_CS_PIN, SPI, 16000000)) {
+    Serial.println("SD 卡初始化失敗！");
+    while (1);
+  }
+
+  scanSDPlaylist();
+  if (playlist.empty()) {
+    Serial.println("未找到 MP3 檔案！");
+    while (1);
+  }
+
+  // 初始化低干擾 Wi-Fi 模式
+  WiFi.mode(WIFI_STA);
+  ESP_ERROR_CHECK(esp_wifi_set_channel(WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE));
+  
+  // 核心防雜音：強制限制最大發射功率（預設 78~80 太高，調成 8 大幅降低射頻干擾）
+  esp_wifi_set_max_tx_power(8); 
+
+  if (esp_now_init() != ESP_OK) return;
+
+  esp_now_peer_info_t peerInfo = {};
+  memcpy(peerInfo.peer_addr, broadcastAddress, 6);
+  peerInfo.channel = WIFI_CHANNEL;
+  peerInfo.encrypt = false;
+  esp_now_add_peer(&peerInfo);
+
+  out = new CustomAudioOutput();
+  out->SetPinout(I2S_BCLK, I2S_LRC, I2S_DIN); 
+  out->SetGain(0.5); 
+
+  mp3 = new AudioGeneratorMP3();
+  playTrack(current_track_index);
+}
+
+void loop() {
+  unsigned long current_ms = millis();
+
+  if (digitalRead(MUTE_BTN_PIN) == LOW && (current_ms - last_mute_btn_press > 300)) {
+    last_mute_btn_press = current_ms;
+    local_mute_state = !local_mute_state;
+    digitalWrite(AMP_SD_PIN, local_mute_state ? LOW : HIGH);
+  }
+
+  if (digitalRead(NEXT_BTN_PIN) == LOW && (current_ms - last_next_btn_press > 400)) {
+    last_next_btn_press = current_ms;
+    current_track_index = (current_track_index + 1) % playlist.size();
+    playTrack(current_track_index);
+  }
+
+  if (mp3 && mp3->isRunning()) {
+    if (!mp3->loop()) {
+      current_track_index = (current_track_index + 1) % playlist.size();
+      playTrack(current_track_index);
+    }
+  }
+}
