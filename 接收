@@ -1,0 +1,143 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <esp_now.h>
+#include <esp_wifi.h>
+#include "driver/i2s.h"
+
+// 完全對齊你的 30 針開發板引腳規劃矩陣表
+#define I2S_LRCK        25  // LRC
+#define I2S_BCLK        26  // BCLK
+#define I2S_DOUT        27  // DIN
+#define MUTE_BUTTON_PIN  2  // 一鍵靜音按鍵
+
+#define WIFI_CHANNEL     1
+
+// 建立軟體超大環形緩衝區（4096 位元組，用來代替外部實體電容抗抖動）
+#define RING_BUF_SIZE 4096
+uint8_t ringBuffer[RING_BUF_SIZE];
+volatile int ringHead = 0;
+volatile int ringTail = 0;
+
+// 計算緩衝區內剩餘可讀取的位元組數量
+int getRingBufferAvailable() {
+  int head = ringHead;
+  int tail = ringTail;
+  if (head >= tail) return head - tail;
+  return (RING_BUF_SIZE - tail) + head;
+}
+
+// 終極防失真：利用 Union 共用記憶體，100% 避免正負號位移型態轉換漏洞
+union StereoSample {
+  struct {
+    int16_t left;   // 自動完美還原 16-bit 帶正負號左聲道
+    int16_t right;  // 自動完美還原 16-bit 帶正負號右聲道
+  } channel;
+  uint8_t bytes[4]; // 剛好對齊發射端過來的 4 位元組群組
+};
+
+volatile bool isMuted = false;
+unsigned long lastDebounceTime = 0;
+
+// 按鍵中斷 (消除彈跳)
+void IRAM_ATTR handleButtonInterrupt() {
+  unsigned long currentTime = millis();
+  if (currentTime - lastDebounceTime > 250) { 
+    isMuted = !isMuted;
+    lastDebounceTime = currentTime;
+  }
+}
+
+// 初始化 30針腳板的硬體 I2S0 通道
+void initI2S() {
+  i2s_config_t i2s_config = {
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
+    .sample_rate = 44100, // 44.1kHz 音訊採樣
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT, 
+    .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT, // 立體聲
+    .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+    .dma_buf_count = 16,  // 加倍 DMA 緩衝區防短暫餓死爆音
+    .dma_buf_len = 256,   
+    .use_apll = false,
+    .tx_desc_alloc_from_high_memory = false
+  };
+
+  i2s_pin_config_t pin_config = {
+    .bck_io_num = I2S_BCLK,
+    .ws_io_num = I2S_LRCK,
+    .data_out_num = I2S_DOUT,
+    .data_in_num = I2S_PIN_NO_CHANGE
+  };
+
+  i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
+  i2s_set_pin(I2S_NUM_0, &pin_config);
+  i2s_zero_dma_buffer(I2S_NUM_0); 
+}
+
+// ESP-NOW 接收中斷回呼函式：將無線數據快速推入環形緩衝區
+void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
+  // 跳過結構體前 4 位元組的標頭 (seq 和 len)，直接提取 data[240]
+  if (len > 4) {
+    int dataLen = len - 4;
+    for (int i = 0; i < dataLen; i++) {
+      int nextHead = (ringHead + 1) % RING_BUF_SIZE;
+      if (nextHead != ringTail) { // 防止緩衝區溢位
+        ringBuffer[ringHead] = incomingData[4 + i];
+        ringHead = nextHead;
+      }
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  pinMode(MUTE_BUTTON_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(MUTE_BUTTON_PIN), handleButtonInterrupt, FALLING);
+
+  initI2S();
+
+  // 初始化無線通訊並降低發射功耗
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  ESP_ERROR_CHECK(esp_wifi_set_channel(WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE));
+  
+  // 接收端同步調低射頻功率，杜絕自體雜訊污染音訊地線
+  esp_wifi_set_max_tx_power(8); 
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("ESP-NOW 初始化失敗！");
+    return;
+  }
+
+  esp_now_register_recv_cb(OnDataRecv);
+  Serial.println("接收端已就緒，等待音訊封包...");
+}
+
+void loop() {
+  if (isMuted) {
+    i2s_zero_dma_buffer(I2S_NUM_0); // 靜音時清空輸出，確保完全無聲
+    delay(10);
+    return;
+  }
+
+  // 核心修復：必須確保緩衝區擁有至少一個完整的 4 位元組立體聲幀才進行解碼
+  while (getRingBufferAvailable() >= 4) {
+    StereoSample frame;
+
+    // 精確按順序提取：左低、左高、右低、右高
+    frame.bytes[0] = ringBuffer[ringTail]; ringTail = (ringTail + 1) % RING_BUF_SIZE;
+    frame.bytes[1] = ringBuffer[ringTail]; ringTail = (ringTail + 1) % RING_BUF_SIZE;
+    frame.bytes[2] = ringBuffer[ringTail]; ringTail = (ringTail + 1) % RING_BUF_SIZE;
+    frame.bytes[3] = ringBuffer[ringTail]; ringTail = (ringTail + 1) % RING_BUF_SIZE;
+
+    // 將解開的立體聲資料放入臨時陣列
+    int16_t out_samples[2];
+    out_samples[0] = frame.channel.left;
+    out_samples[1] = frame.channel.right;
+
+    size_t bytes_written;
+    // 透過 DMA 平滑輸出，徹底瓦解沙沙聲
+    i2s_write(I2S_NUM_0, out_samples, sizeof(out_samples), &bytes_written, portMAX_DELAY);
+  }
+}
